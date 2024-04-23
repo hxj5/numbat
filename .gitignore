@@ -4,3 +4,5 @@
 .Ruserdata
 Numbat*.tar.gz
 Numbat*Rcheck
+src/*.o
+src/*.so

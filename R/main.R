@@ -21,6 +21,147 @@
 #' @useDynLib numbat, .registration=TRUE
 NULL
 
+
+#' Run Numbat RDR module
+#'
+#' @inheritParams run_numbat
+#' @return a status code
+#' @export
+run_numbat_rdr = function(
+        count_mat, lambdas_ref, genome = 'hg38', 
+        out_dir = tempdir(), init_k = 3, 
+        ncores = 1, random_init = FALSE, 
+        verbose = TRUE, plot = TRUE
+    ) {
+
+    ######### Setup output folder #########
+    dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+    logfile = glue('{out_dir}/log.txt')
+    if (file.exists(logfile)) {file.remove(logfile)}
+    log_appender(appender_file(logfile))
+
+    ######### Basic checks #########
+    if (genome == 'hg38') {
+        gtf = gtf_hg38
+    } else if (genome == 'hg19') {
+        gtf = gtf_hg19
+    } else if (genome == 'mm10') {
+        gtf = gtf_mm10
+    } else {
+        stop('Genome version must be hg38, hg19, or mm10')
+    }
+
+    count_mat = check_matrix(count_mat)
+    lambdas_ref = check_exp_ref(lambdas_ref)
+
+    # filter for annotated genes
+    genes_annotated = unique(gtf$gene) %>% 
+        intersect(rownames(count_mat)) %>%
+        intersect(rownames(lambdas_ref))
+
+    count_mat = count_mat[genes_annotated,,drop=FALSE]
+    lambdas_ref = lambdas_ref[genes_annotated,,drop=FALSE]
+
+    zero_cov = names(which(colSums(count_mat) == 0))
+    if (length(zero_cov) > 0) {
+        log_message(glue('Filtering out {length(zero_cov)} cells with 0 coverage'))
+        count_mat = count_mat[,!colnames(count_mat) %in% zero_cov]
+    }
+
+    ######### Log parameters #########
+    log_message(paste('\n',
+        glue('numbat version: ', as.character(utils::packageVersion("numbat"))),
+        glue('scistreer version: ', as.character(utils::packageVersion("scistreer"))),
+        glue('hahmmr version: ', as.character(utils::packageVersion("hahmmr"))),
+        glue('init_k = {init_k}'),
+        glue('ncores = {ncores}'),
+        glue('plot = {plot}'),
+        glue('genome = {genome}'),
+        'Input metrics:',
+        glue('{ncol(count_mat)} cells'),
+        sep = "\n"
+    ), verbose = verbose)
+
+    log_mem()
+
+    RhpcBLASctl::blas_set_num_threads(1)
+    RhpcBLASctl::omp_set_num_threads(1)
+    data.table::setDTthreads(1)
+
+    ######## Initialization ########
+
+    sc_refs = choose_ref_cor(count_mat, lambdas_ref, gtf)
+    saveRDS(sc_refs, glue('{out_dir}/sc_refs.rds'))
+
+    if (random_init) {
+
+        log_message('Initializing with random tree...')
+        n_cells = ncol(count_mat)
+        dist_mat = matrix(rnorm(n_cells^2), nrow=n_cells)
+        colnames(dist_mat) = colnames(count_mat)
+        hc = hclust(as.dist(dist_mat), method = "ward.D2")
+
+        saveRDS(hc, glue('{out_dir}/hc.rds'))
+
+        # extract cell groupings
+        subtrees = get_nodes_celltree(hc, cutree(hc, k = init_k))
+
+    } else if (init_k == 1) {
+
+        log_message('Initializing with all-cell pseudobulk ..', verbose = verbose)
+        log_mem()
+
+        subtrees = list(list('cells' = colnames(count_mat), 'size' = ncol(count_mat), 'sample' = 1))
+
+    } else {
+
+        log_message('Approximating initial clusters using smoothed expression ..', verbose = verbose)
+        log_mem()
+
+        clust = exp_hclust(
+            count_mat = count_mat,
+            lambdas_ref = lambdas_ref,
+            gtf = gtf,
+            sc_refs = sc_refs,
+            ncores = ncores
+        )
+
+        hc = clust$hc
+
+        fwrite(
+            as.data.frame(clust$gexp_roll_wide) %>% tibble::rownames_to_column('cell'),
+            glue('{out_dir}/gexp_roll_wide.tsv.gz'),
+            sep = '\t',
+            nThread = min(4, ncores)
+        )
+
+        saveRDS(hc, glue('{out_dir}/hc.rds'))
+
+        # extract cell groupings
+        subtrees = get_nodes_celltree(hc, cutree(hc, k = init_k))
+
+        if (plot) {
+
+            p = plot_exp_roll(
+                gexp_roll_wide = clust$gexp_roll_wide,
+                hc = hc,
+                k = init_k,
+                gtf = gtf,
+                n_sample = 1e4
+            )
+        
+            ggsave(glue('{out_dir}/exp_roll_clust.png'), p, width = 8, height = 4, dpi = 200)
+
+        }
+
+    }
+    
+    log_message('All done!')
+
+    return('Success')
+}
+
+
 #' Run workflow to decompose tumor subclones
 #'
 #' @param count_mat dgCMatrix Raw count matrices where rownames are genes and column names are cells
